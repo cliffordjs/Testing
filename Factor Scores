@@ -1,0 +1,169 @@
+# i assume that model contains matrices for factorMeans, factorCov and residualCov
+# whatever is in factorMeans will be estimated as a factor score
+# revision 2.5
+
+# revision 2.6: added support for expectation fit (13Mar20 RE)
+
+# TODO: split estimated factor score and factor mean
+
+.tfsErrorCheck <- function(model, datarow, factorMeans, factorCov, residCov, 
+  submodelName="Sub", modelName="FactorScore", nameSuffix=datarow, datarowSelect="name"){
+	## error checking
+	# if model isn't an MxModel, stop
+	if (class(model)[1]=="MxRAMModel"){stop("RAM models not yet supported. Sorry!")}
+	if (class(model)[1]!="MxModel"){stop(paste("'model' argument must be an MxModel. You provided a ", class(model)[1], ".", sep=""))}
+	## data
+	# if there's no data, message
+	if (is.null(model@data))message("No data found in 'model' Transformed model contains no data.")
+	# if the data isn't raw, stop
+	if (model@data@type!="raw")stop("Factor score estimation requires raw data.")
+	# make sure that the requested data row is numeric and in the range of the data
+	if (!is.numeric(datarow))stop("'datarow' argument must be numeric.")
+	datadim <- dim(model@data@observed)
+	if (datarow>datadim[1])stop("Requested data row outside range of data.")
+	# if there's only one column in the data, single-row mxData objects forget their names.
+	if (datadim[2]<2)stop("Factor score estimation with one manifest variable will be colinear with that variable.")
+	# if the data is sorted (such that), then throw a message to the user
+	data.row.names <- as.numeric(row.names(model@data@observed))
+	sorted.data.row.names <- sort(data.row.names)
+	if (any(data.row.names!=sorted.data.row.names)){
+		message(paste("Data in the input model were previously sorted to speed optimization. Row", datarow, "of the unsorted data was used (Row", which(data.row.names==datarow), "in the sorted data)."))
+		
+		}
+	## model structure
+	# if the objective isn't FIML or RAM, stop 
+	#if (!any(class(model@expectation)[1]==c("MxExpectationNormal", "MxExpectationRAM")))stop("'model' expectation must be the MxExpectationNormal")
+	# if there are submodels, stop (a second function is needed for submodels, and should call this function)
+	if (length(model@submodels)!=0)stop("transformFactorScores cannot transform models with submodels.")
+	# if there are no matrices in the model, stop
+	if (length(model@matrices)==0)stop("No matrices found. Are you sure this is a valid model?")
+	## misc
+	# if there are NAs in the labels for the factorMeans, stop
+	if (any(is.na(model[[factorMeans]]@labels)))stop("All parameters in the 'factorMeans' matrix must have labels.")
+	}
+	
+.tfsStandard <- function(model, datarow, factorMeans, factorCov, residCov, 
+	submodelName="Sub", modelName="FactorScore", nameSuffix=datarow, maxCor){
+		# add the suffix, change the name
+	model@name <- paste(submodelName, nameSuffix, sep="")
+	modelName <- paste(modelName, nameSuffix, sep="")
+	
+	## work
+	# hold on to the data, then clear it from the model
+	data <- model@data@observed
+	model@data <- NULL
+	
+	# fix all matrices to free=FALSE except the factorMeans, which should be TRUE
+	mat <- model@matrices
+	matNames <- names(mat)
+	for (i in matNames[matNames!=factorMeans]){
+		model@matrices[[i]]@free[,] <- FALSE
+		}
+	model@matrices[[matNames[matNames==factorMeans]]]@free[,] <- TRUE
+	
+	# hold all matrices used for weighting
+	means <- model@matrices[[matNames[matNames==factorMeans]]]@values
+	covar <- model@matrices[[matNames[matNames==factorCov]]]@values
+	dimnames(means) <- list(NA, model[[factorMeans]]@labels)
+	dimnames(covar) <- list(model[[factorMeans]]@labels, model[[factorMeans]]@labels)
+	
+	# change the model expectation and fit function 
+	# mean, dimnames and thresholds don't need to be affected PROVIDED factorMeans affect manifest means
+	model@objective@covariance <- residCov
+	# set fit to vector=TRUE to return a likelihood rather than a -2LL
+	model@objective@vector <- TRUE
+	# reset the objective function
+	model@objective@result <- matrix(NA, 0, 0)
+	# clear the results
+	model@output <- list()
+	
+	# filter factor covariance matrix 
+	# (anything over maxCor gets filtered out to detect perfectly correlated factors, i.e. A factors in ACE model)
+	facCor <- abs(cov2cor(covar))
+	facCor[upper.tri(facCor, diag=TRUE)] <- 0
+	redund <- facCor>=maxCor
+	keep   <- !apply(redund, 1, any)
+	means  <- means[,keep]
+	covar  <- as.matrix(covar[keep, keep])
+	filter <- diag(length(keep))[,keep]
+	
+	# filter the mean and covariance, and make the weighting algebra
+	filterMat    <- mxMatrix("Full", length(keep), sum(keep), values=filter, name="filter")
+	filteredMean <- mxMatrix("Full", 1, sum(keep), values=means, name="filteredMeans")
+	filteredFS   <- eval(parse(text=paste("mxAlgebra(`", model@name, ".", factorMeans, "` %*% filter, name=\"filteredFS\")", sep="")))
+	firstWeight  <- mxMatrix("Full", 1, 1, values=1/sqrt(det(2*pi*covar)), name="firstWeight")
+	two          <- mxMatrix("Full", 1, 1, values=2, name="two")
+	invCov       <- mxMatrix("Full", sum(keep), sum(keep), values=solve(covar), name="invCov")
+	# here's the weighting algebra
+	weightAlg <- mxAlgebra(firstWeight * exp(-((filteredFS-filteredMeans) %&% invCov)/two), name="weight")
+		
+	# here's the algebra for the objective
+	objAlg <- eval(parse(text=paste("mxAlgebra(-two*log(weight %x% `", model@name, ".objective`), name=\"weightedObjective\")", sep="")))
+	
+	singleModel <- mxModel(modelName, model, 
+		mxData(data[paste(datarow),], "raw"),
+		filterMat, filteredMean, filteredFS, 
+		firstWeight, two, invCov,
+		weightAlg, objAlg, 
+		mxFitFunctionAlgebra("weightedObjective")
+		)
+	
+	return(singleModel)
+		}
+
+.tfsRAM <- function(model, datarow, submodelName, modelName, nameSuffix, maxCor){
+	# if there are no means, stop
+	if(is.na(model@objective@M))stop("No M Matrix Detected. Please respecify your model to include expected means.")
+	
+	# grab the A, S, F and M matrices, make an I matrix
+	A <- model@matrices[[model@objective@A]]@values
+	S <- model@matrices[[model@objective@S]]@values
+	F <- model@matrices[[model@objective@F]]@values
+	M <- model@matrices[[model@objective@M]]@values
+	I <- diag(dim(A)[1])
+	
+	# calculate the model expected covariance and means
+	expCov  <- solve(I-A) %*% S %*% t(solve(I-A))
+	expMean <- M %*% t(solve(I-A))
+	
+	# spot the manifest and latent variables (can't assume that people are using manifestVars slots)
+	use  <- as.logical(apply(F, 2, sum))
+	vars <- dimnames(A)[[2]]
+	man  <- vars[use]
+	lat  <- vars[!use]
+	
+	latCov <- expCov[!use, !use]
+	
+	## try to spot residual factors
+	# residual factors are assumed to be exogenous factors with one non-zero loading on a manifest variable and no other covariances
+	# look for things with no covariance with other latent variables
+	lc1 <- abs(latCov)           # take the absolute value of the latent covariance matrix
+	diag(lc1) <- 0               # zero out the variances
+	lc2 <- apply(lc1, 2, sum)    # sum the covariances for each column
+	orthog <- lat[lc2==0]        # any columns with zero covariances in the model are orthogonal
+	# look for orthogonal latent variables with one non-zero manifest loading
+	
+	
+	
+	# factorCov <- 
+	
+	return(orthog)
+	}
+
+transformFactorScores <- function(model, datarow, factorMeans, factorCov, residCov, 
+	submodelName="Sub", modelName="FactorScore", nameSuffix=datarow, maxCor=.99){
+		
+	## error checking
+	.tfsErrorCheck(model, datarow, factorMeans, factorCov, residCov, submodelName, modelName, nameSuffix)
+		
+	## call .tfsStandard for most models, .tfsRAM for RAM/path models
+	
+	if (class(model@objective)[1]=="MxFIMLObjective"){
+		retval <- .tfsStandard(model, datarow, factorMeans, factorCov, residCov, submodelName, modelName, nameSuffix, maxCor)}
+	if (class(model@ objective)[1]=="MxRAMObjective"){retval <- .tfsRAM(model, datarow, submodelName, modelName, nameSuffix, maxCor)}
+	return(retval)
+	}
+	
+#d <- transformFactorScores(first, 1, "facMean", "L", "U")
+
+#d
